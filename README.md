@@ -1,4 +1,4 @@
-# LeetPicker
+# Leet-Picker
 
 定時挑選 LeetCode 題目的 CLI 工具，支援 Telegram 推播通知。純 Python 標準函式庫，無需安裝外部套件。
 
