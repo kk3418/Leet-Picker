@@ -183,6 +183,122 @@ def do_pick_problem(difficulty: List[str], history_ids: set) -> Optional[Dict[st
     return random.choice(filtered)
 
 
+# ─── Telegram 推播 ───────────────────────────────────────────────────────────
+
+def _resolve_telegram_ip() -> Optional[str]:
+    """用 DNS 查詢 api.telegram.org 真實 IP，避免本機 DNS 劫持"""
+    import socket
+    try:
+        results = socket.getaddrinfo("api.telegram.org", 443)
+        for family, _, _, _, addr in results:
+            if family == socket.AF_INET and addr[0] != "127.0.0.1":
+                return addr[0]
+    except Exception:
+        pass
+    # getaddrinfo 被劫持時，用 subprocess 呼叫 nslookup 取真實 IP
+    try:
+        out = subprocess.run(
+            ["nslookup", "api.telegram.org"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Address:") or line.startswith("Address"):
+                ip = line.split(":")[-1].strip().split("#")[0].strip()
+                if ip and ip != "127.0.0.1" and not ip.startswith("168."):
+                    return ip
+    except Exception:
+        pass
+    return None
+
+
+_TG_REAL_IP: Optional[str] = None
+
+
+def tg_api(token: str, method: str, params: Dict[str, Any] = None, http_timeout: int = 10) -> Optional[Dict]:
+    """呼叫 Telegram Bot API，失敗回傳 None"""
+    import ssl
+    import socket
+
+    global _TG_REAL_IP
+
+    host = "api.telegram.org"
+    path = f"/bot{token}/{method}"
+    data = json.dumps(params or {}).encode()
+
+    # 先嘗試正常連線
+    url = f"https://{host}{path}"
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=http_timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        print(colored(f"Telegram API 錯誤 ({method}): HTTP {e.code}", RED))
+        return None
+    except Exception:
+        pass  # DNS 劫持等問題，改用 IP 直連
+
+    # 正常連線失敗，用 IP 直連繞過 DNS 劫持
+    if _TG_REAL_IP is None:
+        _TG_REAL_IP = _resolve_telegram_ip() or ""
+    if not _TG_REAL_IP:
+        print(colored(f"Telegram API 錯誤 ({method}): 無法解析 api.telegram.org", RED))
+        return None
+
+    url_ip = f"https://{_TG_REAL_IP}{path}"
+    req_ip = urllib.request.Request(url_ip, data=data, headers={
+        "Content-Type": "application/json",
+        "Host": host,
+    })
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req_ip, timeout=http_timeout, context=ctx) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        print(colored(f"Telegram API 錯誤 ({method}): HTTP {e.code}", RED))
+        return None
+    except Exception as e:
+        print(colored(f"Telegram API 錯誤 ({method}): {e}", RED))
+        return None
+
+
+def tg_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def notify_self(token: str, chat_id: int, problem: Dict[str, Any]):
+    diff_emoji = {"Easy": "🟢", "Medium": "🟡", "Hard": "🔴"}.get(problem["difficulty"], "⚪")
+    url = PROBLEM_URL.format(slug=problem["slug"])
+    text = (
+        f"🎯 <b>今日 LeetCode 題目更新！</b>\n\n"
+        f"📝 <b>{tg_escape(str(problem['frontend_id']))}. {tg_escape(problem['title'])}</b>\n"
+        f"{diff_emoji} 難度：{problem['difficulty']}\n"
+        f'🔗 <a href="{url}">開始作答</a>'
+    )
+    result = tg_api(token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    })
+    if result and result.get("ok"):
+        print(colored("✓ 已發送 Telegram 通知", CYAN))
+    else:
+        print(colored("⚠ Telegram 通知發送失敗", DIM))
+
+
+def try_notify_self(problem: Dict[str, Any]):
+    """若已設定 Telegram，發送換題通知；未設定則靜默略過"""
+    config = load_config()
+    token = config.get("telegram_token")
+    chat_id = config.get("telegram_chat_id")
+    if not token or not chat_id:
+        return
+    notify_self(token, chat_id, problem)
+
+
 # ─── 顯示函數 ────────────────────────────────────────────────────────────────
 
 def print_box(lines: List[str], title: str = ""):
@@ -252,6 +368,7 @@ def cmd_today(_args):
             history.append({**problem, "picked_date": str(date.today())})
             save_history(history)
             display_problem(problem)
+            try_notify_self(problem)
     else:
         if current:
             next_date = date.fromisoformat(last_pick) + timedelta(days=freq)
@@ -386,6 +503,114 @@ def cmd_pick(_args):
         history.append({**problem, "picked_date": str(date.today())})
         save_history(history)
         display_problem(problem, label="新題目")
+        try_notify_self(problem)
+
+
+def cmd_bot(args):
+    """Telegram 推播通知設定"""
+    config = load_config()
+
+    if args.bot_cmd == "setup":
+        if not args.token:
+            print(colored("請提供 bot token：leet bot setup <token>", RED))
+            sys.exit(1)
+
+        result = tg_api(args.token, "getMe")
+        if not result:
+            print(colored("無法連線到 Telegram，請確認網路連線或 proxy 設定", RED))
+            sys.exit(1)
+        if not result.get("ok"):
+            print(colored("Token 無效，請確認後重試", RED))
+            sys.exit(1)
+        bot_name = result["result"].get("username", "unknown")
+
+        print(colored(f"✓ Bot @{bot_name} 驗證成功", GREEN))
+
+        # 清除 webhook，確保 getUpdates 能正常運作
+        tg_api(args.token, "deleteWebhook")
+
+        # 先記下目前最新的 update_id，避免抓到舊訊息
+        snapshot = tg_api(args.token, "getUpdates", {"limit": 1, "timeout": 0})
+        offset = 0
+        if snapshot and snapshot.get("ok") and snapshot.get("result"):
+            offset = snapshot["result"][-1]["update_id"] + 1
+
+        print(colored(f"  請在 Telegram 傳送任意訊息給 @{bot_name}", YELLOW))
+        print(colored("  （等待中，最多 60 秒，Ctrl+C 取消）", DIM))
+
+        chat_id = None
+        first_name = ""
+        try:
+            for _ in range(12):  # 每次最多等 5 秒，共 12 次 = 60 秒
+                updates = tg_api(args.token, "getUpdates", {
+                    "offset": offset, "limit": 1, "timeout": 5,
+                }, http_timeout=10)
+                if updates and updates.get("ok"):
+                    for update in updates.get("result", []):
+                        offset = update["update_id"] + 1
+                        msg = update.get("message", {})
+                        cid = msg.get("chat", {}).get("id")
+                        if cid:
+                            chat_id = cid
+                            first_name = msg.get("from", {}).get("first_name", "")
+                if chat_id:
+                    break
+        except KeyboardInterrupt:
+            print(colored("\n已取消", DIM))
+            return
+
+        if not chat_id:
+            print(colored("等待超時，請再執行一次 leet bot setup", RED))
+            sys.exit(1)
+
+        config["telegram_token"] = args.token
+        config["telegram_chat_id"] = chat_id
+        save_config(config)
+        print(colored(f"✓ 設定完成！將推播通知給：{first_name}（chat_id: {chat_id}）", GREEN, BOLD))
+        print(colored("  執行 leet bot test 測試是否正常", DIM))
+        python = sys.executable
+        script = str(Path(__file__).resolve())
+        print()
+        print(colored("  ── 自動排程設定 ──", DIM))
+        print(colored("  執行 crontab -e，加入以下這行（每天早上 9 點檢查）：", DIM))
+        print(colored(f"  0 20 * * * {python} {script} today", CYAN))
+
+    elif args.bot_cmd == "test":
+        token = config.get("telegram_token")
+        chat_id = config.get("telegram_chat_id")
+        if not token or not chat_id:
+            print(colored("尚未設定，請先執行：leet bot setup <token>", RED))
+            sys.exit(1)
+        result = tg_api(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "🧪 <b>LeetPicker 測試通知</b>\n\n設定成功！每次換題時你會收到這樣的推播 🎉",
+            "parse_mode": "HTML",
+        })
+        if result and result.get("ok"):
+            print(colored("✓ 測試訊息已發送，請查看 Telegram", GREEN))
+        else:
+            print(colored("✗ 發送失敗，請確認 token 與 chat_id 是否正確", RED))
+
+    elif args.bot_cmd == "status":
+        token = config.get("telegram_token")
+        chat_id = config.get("telegram_chat_id")
+        print()
+        print(colored("  Telegram 推播狀態", BOLD, CYAN))
+        print(colored("─" * 40, DIM))
+        if token:
+            me = tg_api(token, "getMe")
+            if me and me.get("ok"):
+                print(f"  Bot     : @{me['result'].get('username', 'unknown')}")
+                print(f"  Chat ID : {chat_id if chat_id else colored('未設定', YELLOW)}")
+                print(colored("  狀態    : 正常", GREEN))
+            else:
+                print(colored("  Token 已設定但無法連線", YELLOW))
+        else:
+            print(colored("  尚未設定（執行 leet bot setup <token>）", YELLOW))
+        print()
+
+    else:
+        print(colored("用法：leet bot <setup|test|status> [token]", RED))
 
 
 def cmd_config(args):
@@ -571,6 +796,7 @@ def build_parser() -> argparse.ArgumentParser:
   config    查看或修改設定
   status    查看目前狀態與當前題目
   history   查看歷史紀錄（含完成狀態）
+  bot       Telegram 推播通知設定
 
 範例：
   leet                           # 取得今日題目
@@ -586,6 +812,9 @@ def build_parser() -> argparse.ArgumentParser:
   leet history -r                # 只顯示複習題
   leet history -s difficulty     # 依難度排序（Hard 優先）
   leet history -s id -a          # 依題號排序，顯示全部
+  leet bot setup <token>         # 設定 Telegram 推播（互動式）
+  leet bot test                  # 發送測試通知
+  leet bot status                # 查看 Telegram 設定狀態
         """,
     )
     sub = parser.add_subparsers(dest="cmd")
@@ -619,6 +848,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_review.add_argument("problem_id", nargs="?", type=int, help="題號（不填則標記當前題目）")
     p_review.add_argument("-r", "--remove", action="store_true", help="移除複習標記")
 
+    # bot
+    p_bot = sub.add_parser("bot", help="Telegram 推播通知設定")
+    p_bot.add_argument(
+        "bot_cmd",
+        choices=["setup", "test", "status"],
+        help="操作：setup 設定 token、test 測試通知、status 查看狀態",
+    )
+    p_bot.add_argument("token", nargs="?", help="Bot token（setup 時使用）")
+
     # status
     sub.add_parser("status", help="查看目前狀態與當前題目")
 
@@ -646,6 +884,7 @@ COMMANDS = {
     "config":  cmd_config,
     "status":  cmd_status,
     "history": cmd_history,
+    "bot":     cmd_bot,
 }
 
 
