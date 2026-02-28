@@ -321,22 +321,38 @@ def cmd_review(args):
             print(colored(f"★ 已標記為複習：{title}", CYAN, BOLD))
 
 
-def cmd_solved(_args):
-    """將當前題目標記為已完成"""
+def cmd_solved(args):
+    """將題目標記為已完成（不給題號則標記今日題目）"""
     config = load_config()
     history = load_history()
 
-    current = config.get("current_problem")
-    if not current:
-        print(colored("目前沒有進行中的題目", YELLOW))
-        return
-
-    if mark_current_solved(config, history):
-        save_history(history)
-        title = f"{current['frontend_id']}. {current['title']}"
-        print(colored(f"✓ 已完成：{title}", GREEN, BOLD))
+    if args.problem_id:
+        target = None
+        for h in reversed(history):
+            if h.get("frontend_id") == str(args.problem_id):
+                target = h
+                break
+        if not target:
+            print(colored(f"在歷史紀錄中找不到題號 {args.problem_id}", RED))
+            return
+        title = f"{target['frontend_id']}. {target.get('title', '?')}"
+        if target.get("solved_date"):
+            print(colored(f"該題目已經標記為完成了：{title}", DIM))
+        else:
+            target["solved_date"] = str(date.today())
+            save_history(history)
+            print(colored(f"✓ 已完成：{title}", GREEN, BOLD))
     else:
-        print(colored("當前題目已經標記為完成了", DIM))
+        current = config.get("current_problem")
+        if not current:
+            print(colored("目前沒有進行中的題目", YELLOW))
+            return
+        if mark_current_solved(config, history):
+            save_history(history)
+            title = f"{current['frontend_id']}. {current['title']}"
+            print(colored(f"✓ 已完成：{title}", GREEN, BOLD))
+        else:
+            print(colored("當前題目已經標記為完成了", DIM))
 
 
 def cmd_pick(_args):
@@ -559,7 +575,8 @@ def build_parser() -> argparse.ArgumentParser:
 範例：
   leet                           # 取得今日題目
   leet pick                      # 立即選新題
-  leet solved                    # 標記當前題目為完成
+  leet solved                    # 標記今日題目為完成
+  leet solved 42                 # 標記題號 42 為完成
   leet review                    # 標記當前題目為複習
   leet review 42                 # 標記題號 42 為複習
   leet review 42 -r              # 移除題號 42 的複習標記
@@ -594,7 +611,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # solved
-    sub.add_parser("solved", help="將當前題目標記為已完成")
+    p_solved = sub.add_parser("solved", help="將題目標記為已完成")
+    p_solved.add_argument("problem_id", nargs="?", type=int, help="題號（不填則標記今日題目）")
 
     # review
     p_review = sub.add_parser("review", help="標記題目為需要複習")
