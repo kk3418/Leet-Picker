@@ -30,6 +30,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "frequency_days": 1,
     "last_pick_date": None,
     "current_problem": None,
+    "review_threshold": 20,
+    "review_probability": 0.25,
 }
 
 # ─── ANSI 顏色 ───────────────────────────────────────────────────────────────
@@ -153,34 +155,40 @@ def fetch_problems() -> List[Dict[str, Any]]:
     return problems
 
 
-def get_review_ids() -> set:
-    """取得所有標記為複習的題目 ID"""
-    history = load_history()
-    return {h["id"] for h in history if h.get("review")}
+def do_pick_problem(difficulty: List[str], history: List[Dict[str, Any]], config: Dict[str, Any]) -> tuple:
+    """根據難度和歷史紀錄挑選一題，回傳 (problem, is_review)
 
+    複習題直接從 history 取資料，不重新 fetch LeetCode。
+    當已做題數 >= review_threshold 時，以 review_probability 機率抽複習題。
+    """
+    history_ids = {h["id"] for h in history}
+    num_done = len(history_ids)
+    threshold = config.get("review_threshold", 20)
+    prob = config.get("review_probability", 0.25)
 
-def do_pick_problem(difficulty: List[str], history_ids: set) -> Optional[Dict[str, Any]]:
-    """根據難度和歷史紀錄挑選一題（優先選未做過的，複習題有機率出現）"""
+    # 當已做題數 >= 閾值時，以指定機率抽複習題（同題號取最新那筆）
+    review_pool: Dict[int, Dict[str, Any]] = {}
+    if num_done >= threshold:
+        for h in history:
+            if h.get("review") and h.get("difficulty") in difficulty:
+                review_pool[h["id"]] = h
+
+        if review_pool and random.random() < prob:
+            target = random.choice(list(review_pool.values()))
+            print(colored("★ 複習時間！這是你標記要複習的題目", CYAN, BOLD))
+            return target, True
+
     problems = fetch_problems()
     filtered = [p for p in problems if p["difficulty"] in difficulty]
     if not filtered:
         print(colored("沒有符合條件的題目", RED))
-        return None
-
-    review_ids = get_review_ids()
-    review_candidates = [p for p in filtered if p["id"] in review_ids]
-
-    # 30% 機率抽複習題（如果有的話）
-    if review_candidates and random.random() < 0.3:
-        problem = random.choice(review_candidates)
-        print(colored("★ 複習時間！這是你標記要複習的題目", CYAN, BOLD))
-        return problem
+        return None, False
 
     not_done = [p for p in filtered if p["id"] not in history_ids]
     if not_done:
-        return random.choice(not_done)
+        return random.choice(not_done), False
     print(colored("恭喜！你已完成所有符合條件的題目！從全部重新選取...", YELLOW))
-    return random.choice(filtered)
+    return random.choice(filtered), False
 
 
 # ─── Telegram 推播 ───────────────────────────────────────────────────────────
@@ -349,7 +357,6 @@ def cmd_today(_args):
     """顯示今日題目（根據頻率自動決定是否更換新題）"""
     config = load_config()
     history = load_history()
-    history_ids = {h["id"] for h in history}
 
     last_pick = config.get("last_pick_date")
     freq = config.get("frequency_days", 1)
@@ -360,12 +367,18 @@ def cmd_today(_args):
     )
 
     if should_pick:
-        problem = do_pick_problem(config["difficulty"], history_ids)
+        problem, is_review = do_pick_problem(config["difficulty"], history, config)
         if problem:
             config["last_pick_date"] = str(date.today())
             config["current_problem"] = problem
             save_config(config)
-            history.append({**problem, "picked_date": str(date.today())})
+            if is_review:
+                for h in reversed(history):
+                    if h["id"] == problem["id"]:
+                        h["review_date"] = str(date.today())
+                        break
+            else:
+                history.append({**problem, "picked_date": str(date.today())})
             save_history(history)
             display_problem(problem)
             try_notify_self(problem)
@@ -494,13 +507,18 @@ def cmd_pick(_args):
                 print(colored("✓ 已標記為完成", GREEN))
             history = load_history()  # 重新載入確保資料一致
 
-    history_ids = {h["id"] for h in history}
-    problem = do_pick_problem(config["difficulty"], history_ids)
+    problem, is_review = do_pick_problem(config["difficulty"], history, config)
     if problem:
         config["last_pick_date"] = str(date.today())
         config["current_problem"] = problem
         save_config(config)
-        history.append({**problem, "picked_date": str(date.today())})
+        if is_review:
+            for h in reversed(history):
+                if h["id"] == problem["id"]:
+                    h["review_date"] = str(date.today())
+                    break
+        else:
+            history.append({**problem, "picked_date": str(date.today())})
         save_history(history)
         display_problem(problem, label="新題目")
         try_notify_self(problem)
@@ -614,7 +632,7 @@ def cmd_bot(args):
 
 
 def cmd_config(args):
-    """查看或修改難度與頻率設定"""
+    """查看或修改難度、頻率與複習設定"""
     config = load_config()
     changed = False
 
@@ -637,14 +655,24 @@ def cmd_config(args):
         changed = True
         print(colored(f"✓ 頻率已設定為: {freq_label(args.frequency)}", GREEN))
 
+    if hasattr(args, "review_threshold") and args.review_threshold is not None:
+        config["review_threshold"] = args.review_threshold
+        changed = True
+        print(colored(f"✓ 複習啟動題數已設定為: {args.review_threshold}", GREEN))
+
+    if hasattr(args, "review_prob") and args.review_prob is not None:
+        config["review_probability"] = args.review_prob
+        changed = True
+        print(colored(f"✓ 複習機率已設定為: {args.review_prob * 100:.0f}%", GREEN))
+
     if changed:
         save_config(config)
         return
 
     # 顯示目前設定
     print()
-    row_fmt = f"  {{:<10}} {{}}"
-    sep = colored("─" * 40, DIM)
+    row_fmt = f"  {{:<12}} {{}}"
+    sep = colored("─" * 44, DIM)
     print(colored("  目前設定", BOLD, CYAN))
     print(sep)
 
@@ -653,6 +681,8 @@ def cmd_config(args):
         diff_parts.append(colored(d, DIFF_COLORS.get(d, WHITE)))
     print(row_fmt.format("難度", " / ".join(diff_parts)))
     print(row_fmt.format("頻率", freq_label(config["frequency_days"])))
+    print(row_fmt.format("複習啟動", f"{config.get('review_threshold', 20)} 題"))
+    print(row_fmt.format("複習機率", f"{config.get('review_probability', 0.25) * 100:.0f}%"))
 
     last_pick = config.get("last_pick_date")
     if last_pick:
@@ -661,7 +691,7 @@ def cmd_config(args):
         print(row_fmt.format("下次選題", str(next_date)))
 
     print(sep)
-    print(colored("  修改範例: leet config -d easy,medium -f 2", DIM))
+    print(colored("  修改範例: leet config -d easy,medium -f 2 --review-threshold 15 --review-prob 0.3", DIM))
     print()
 
 
@@ -703,12 +733,12 @@ def cmd_status(_args):
 
 
 SORT_CONFIG = {
-    #           key_fn                                                    reverse  label
-    "date":     (lambda h: h.get("picked_date", ""),                     True,   "日期（新→舊）"),
-    "date-asc": (lambda h: h.get("picked_date", ""),                     False,  "日期（舊→新）"),
+    #           key_fn                                                                        reverse  label
+    "date":     (lambda h: h.get("review_date") or h.get("picked_date", ""),                True,   "日期（新→舊）"),
+    "date-asc": (lambda h: h.get("review_date") or h.get("picked_date", ""),                False,  "日期（舊→新）"),
     "difficulty":(lambda h: {"Easy": 0, "Medium": 1, "Hard": 2}.get(h.get("difficulty", ""), -1),
-                                                                          True,   "難度（Hard→Easy）"),
-    "id":       (lambda h: int(h.get("frontend_id") or 0),               False,  "題號"),
+                                                                                             True,   "難度（Hard→Easy）"),
+    "id":       (lambda h: int(h.get("frontend_id") or 0),                                  False,  "題號"),
 }
 
 
@@ -766,9 +796,10 @@ def cmd_history(args):
         solved = h.get("solved_date")
         status = colored("✓ 完成", GREEN) if solved else colored("✗ 未完成", DIM)
         review_mark = colored(" ★", CYAN) if h.get("review") else ""
+        display_date = h.get("review_date") or h.get("picked_date", "?")
         print(
             "  " + pad(str(i), W_IDX) + " "
-            + pad(h.get("picked_date", "?"), W_DATE) + " "
+            + pad(display_date, W_DATE) + " "
             + pad(h.get("frontend_id", "?"), W_FID) + " "
             + pad(title, W_TITLE) + " "
             + colored(pad(diff, W_DIFF), diff_c) + " "
@@ -792,29 +823,31 @@ def build_parser() -> argparse.ArgumentParser:
   today     顯示今日題目（根據頻率自動判斷是否換題）
   pick      立即強制挑選新題目（會詢問當前題目是否完成）
   solved    將當前題目標記為已完成
-  review    標記題目為需要複習（pick 時有 30% 機率抽到複習題）
+  review    標記題目為需要複習（當題數達到閾值時有機率抽到複習題）
   config    查看或修改設定
   status    查看目前狀態與當前題目
   history   查看歷史紀錄（含完成狀態）
   bot       Telegram 推播通知設定
 
 範例：
-  leet                           # 取得今日題目
-  leet pick                      # 立即選新題
-  leet solved                    # 標記今日題目為完成
-  leet solved 42                 # 標記題號 42 為完成
-  leet review                    # 標記當前題目為複習
-  leet review 42                 # 標記題號 42 為複習
-  leet review 42 -r              # 移除題號 42 的複習標記
-  leet config -d easy,medium     # 設定難度為 Easy + Medium
-  leet config -f 7               # 設定頻率為每週
-  leet history -n 10             # 查看最近 10 筆（日期由新到舊）
-  leet history -r                # 只顯示複習題
-  leet history -s difficulty     # 依難度排序（Hard 優先）
-  leet history -s id -a          # 依題號排序，顯示全部
-  leet bot setup <token>         # 設定 Telegram 推播（互動式）
-  leet bot test                  # 發送測試通知
-  leet bot status                # 查看 Telegram 設定狀態
+  leet                                     # 取得今日題目
+  leet pick                                # 立即選新題
+  leet solved                              # 標記今日題目為完成
+  leet solved 42                           # 標記題號 42 為完成
+  leet review                              # 標記當前題目為複習
+  leet review 42                           # 標記題號 42 為複習
+  leet review 42 -r                        # 移除題號 42 的複習標記
+  leet config -d easy,medium               # 設定難度為 Easy + Medium
+  leet config -f 7                         # 設定頻率為每週
+  leet config --review-threshold 25        # 設定複習啟動題數為 25
+  leet config --review-prob 0.3            # 設定複習機率為 30%
+  leet history -n 10                       # 查看最近 10 筆（日期由新到舊）
+  leet history -r                          # 只顯示複習題
+  leet history -s difficulty               # 依難度排序（Hard 優先）
+  leet history -s id -a                    # 依題號排序，顯示全部
+  leet bot setup <token>                   # 設定 Telegram 推播（互動式）
+  leet bot test                            # 發送測試通知
+  leet bot status                          # 查看 Telegram 設定狀態
         """,
     )
     sub = parser.add_subparsers(dest="cmd")
@@ -837,6 +870,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DAYS",
         type=int,
         help="頻率（天數）：1=每天、2=每兩天、7=每週",
+    )
+    p_config.add_argument(
+        "--review-threshold",
+        metavar="NUM",
+        type=int,
+        help="複習啟動題數（預設 20，當已做題數達到此數時才會抽複習題）",
+    )
+    p_config.add_argument(
+        "--review-prob",
+        metavar="PROB",
+        type=float,
+        help="複習機率（預設 0.25，範圍 0.0-1.0）",
     )
 
     # solved
